@@ -1,0 +1,20 @@
+{
+  "movies": [
+    {
+      "code": "EXAM-001",
+      "title": "示例作品一（请替换为公开元数据）",
+      "japanese_title": "サンプル作品一",
+      "release_date": "2026-09-01",
+      "manufacturer": "示例制作商",
+      "publisher": "示例发行商",
+      "series": "示例系列",
+      "cover_url": "",
+      "detail_url": ""
+    },
+    {
+      "code": "EXAM-002",
+      "title": "示例作品二（请替换为公开元数据）",
+      "release_date": "2026-09-15"
+    }
+  ]
+}

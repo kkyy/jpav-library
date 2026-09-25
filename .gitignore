@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+build-next*/
+dist-next*/
+JPAVLibrary.spec
+artifacts/
+examples/tsubasa-mai-s1-catalog.json
+*.sqlite3*
+*.db*
+.env
