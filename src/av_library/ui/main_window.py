@@ -1,23 +1,21 @@
-from datetime import UTC
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Slot
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QComboBox,
     QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QScrollArea,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,7 +26,8 @@ from av_library.db.models import Actress
 from av_library.services.actresses import ActressService, ValidationError
 from av_library.services.automatic_sync import AutomaticSyncService
 from av_library.services.backups import BackupService
-from av_library.services.matching import MatchService
+from av_library.services.covers import CoverService
+from av_library.services.matching import MatchService, MovieView
 from av_library.services.metadata_sync import MetadataService
 from av_library.services.scanning import ScanService
 from av_library.services.search import SearchService
@@ -49,7 +48,7 @@ def label(text: str, style: str = "", wrap: bool = False) -> QLabel:
     return result
 
 
-class AutomaticSyncWorker(QThread):
+class GlobalUpdateWorker(QThread):
     def __init__(self, service: AutomaticSyncService, parent=None):
         super().__init__(parent)
         self.service = service
@@ -58,158 +57,227 @@ class AutomaticSyncWorker(QThread):
 
     def run(self):
         try:
-            self.result = self.service.run_due(self.cancel)
-        except Exception:  # noqa: BLE001 -- worker boundary; startup remains usable
+            self.result = self.service.run_due(self.cancel, force=True)
+        except Exception:  # noqa: BLE001 -- worker boundary
             self.result = (0, 1)
+
+
+class CoverBatchWorker(QThread):
+    ready = Signal(dict)
+
+    def __init__(self, covers: CoverService, urls: list[str], parent=None):
+        super().__init__(parent)
+        self.covers, self.urls = covers, urls
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch(url):
+            try:
+                path = self.covers.fetch(url)
+                return url, str(path)
+            except Exception:  # noqa: BLE001 -- an unavailable cover leaves its placeholder
+                return url, ""
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            self.ready.emit(dict(pool.map(fetch, self.urls)))
 
 
 class MainWindow(QMainWindow):
     def __init__(self, service: ActressService, paths: AppPaths):
         super().__init__()
         self.service, self.paths = service, paths
+        self.covers = CoverService(paths.covers)
         self.current: Actress | None = None
         self.rows: list[Actress] = []
         self.summaries = {}
-        self.auto_worker: AutomaticSyncWorker | None = None
+        self.movie_rows: list[MovieView] = []
+        self.selected_movie: MovieView | None = None
+        self.auto_worker: GlobalUpdateWorker | None = None
+        self.cover_worker: CoverBatchWorker | None = None
+        self.cover_paths: dict[str, str] = {}
+        self.movie_search_text = ""
         self.setWindowTitle("本地作品库 · JPAV Library")
-        self.resize(1200, 780)
-        self.setMinimumSize(980, 680)
+        self.resize(1280, 860)
+        self.setMinimumSize(1000, 700)
+
         root = QWidget()
         self.setCentralWidget(root)
-        layout = QHBoxLayout(root)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(24)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(16)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(190)
+        sidebar.setFixedWidth(168)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(20, 26, 20, 22)
+        side.setContentsMargins(16, 24, 16, 18)
+        side.setSpacing(10)
         side.addWidget(label("本地作品库", "brand"))
-        side.addWidget(label("JPAV LIBRARY"))
-        side.addSpacing(36)
-        side.addWidget(label("●  女优管理", "subheading"))
-        side.addSpacing(14)
-        side.addWidget(label("本地保存 · 私人管理"))
+        side.addWidget(label("JPAV LIBRARY", "sidecaption"))
+        side.addSpacing(22)
+        self.side_home = QPushButton("◈  女优收藏")
+        self.side_home.clicked.connect(self.show_actress_grid)
+        side.addWidget(self.side_home)
         side.addStretch()
-        settings = QPushButton("备份与恢复")
-        settings.clicked.connect(self.show_storage)
-        side.addWidget(settings)
+        storage = QPushButton("备份与恢复")
+        storage.clicked.connect(self.show_storage)
+        side.addWidget(storage)
         preferences = QPushButton("设置")
         preferences.clicked.connect(self.show_settings)
         side.addWidget(preferences)
-        side.addWidget(label("PHASE 06 / 06\n本地作品管理", wrap=True))
-        layout.addWidget(sidebar)
+        outer.addWidget(sidebar)
+
         body = QVBoxLayout()
-        body.setSpacing(18)
-        layout.addLayout(body, 1)
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.addWidget(label("作品收藏总览", "heading"))
-        titles.addWidget(label("按女优查看已收录、已收藏与缺少作品。", "muted"))
-        header.addLayout(titles)
-        header.addStretch()
+        body.setSpacing(12)
+        outer.addLayout(body, 1)
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setClearButtonEnabled(True)
+        self.search.setPlaceholderText("搜索女优名称、别名、番号或作品标题")
+        self.search.textChanged.connect(self.on_search_changed)
+        toolbar.addWidget(self.search, 1)
         self.add_button = QPushButton("＋ 添加女优")
         self.add_button.setObjectName("primary")
         self.add_button.clicked.connect(lambda: self.edit_actress(new=True))
-        header.addWidget(self.add_button)
-        body.addLayout(header)
-        body.addWidget(
-            label(
-                "本地扫描只读取视频文件名。完成度以已收录作品为基数；来源覆盖范围可能不完整。",
-                "notice",
-                True,
-            )
-        )
-        search_row = QHBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索常用名、日文名或别名…")
-        self.search.textChanged.connect(lambda: self.reload())
-        search_row.addWidget(self.search)
-        self.global_button = QPushButton("全局搜索")
-        self.global_button.clicked.connect(self.open_global_search)
-        search_row.addWidget(self.global_button)
-        self.sort = QComboBox()
-        self.sort.addItems(["最近更新", "完成度", "作品数量", "缺少数量"])
-        self.sort.currentIndexChanged.connect(lambda: self.reload())
-        search_row.addWidget(self.sort)
+        toolbar.addWidget(self.add_button)
+        self.global_button = QPushButton("↻ 全局更新")
+        self.global_button.clicked.connect(self.global_update)
+        toolbar.addWidget(self.global_button)
+        self.global_search_button = QPushButton("全局搜索")
+        self.global_search_button.clicked.connect(self.open_global_search)
+        toolbar.addWidget(self.global_search_button)
+        body.addLayout(toolbar)
+
+        self.stack = QStackedWidget()
+        body.addWidget(self.stack, 1)
+        self.grid_page = QWidget()
+        grid_layout = QVBoxLayout(self.grid_page)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(10)
+        grid_header = QHBoxLayout()
+        grid_header.addWidget(label("女优收藏", "heading"))
+        grid_header.addStretch()
         self.count_label = label("", "muted")
-        search_row.addWidget(self.count_label)
-        body.addLayout(search_row)
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["女优", "收藏", "缺少", "完成度", "最新作品", "最近更新", "本地目录"]
-        )
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(52)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.table.itemSelectionChanged.connect(self.select_row)
-        self.table.cellDoubleClicked.connect(lambda *_: self.edit_actress())
-        body.addWidget(self.table, 1)
-        self.empty = label("还没有女优资料。点击右上角「添加女优」开始。", "muted", True)
-        body.addWidget(self.empty)
-        self.detail = QFrame()
-        self.detail.setObjectName("card")
-        detail_layout = QVBoxLayout(self.detail)
-        detail_layout.setContentsMargins(22, 20, 22, 20)
-        info = QHBoxLayout()
-        self.avatar = label("", "avatar")
-        self.avatar.setFixedSize(74, 74)
-        self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        info.addWidget(self.avatar)
-        info_text = QVBoxLayout()
-        self.detail_name = label("", "subheading")
-        self.detail_aliases = label("", "muted", True)
-        info_text.addWidget(self.detail_name)
-        info_text.addWidget(self.detail_aliases)
-        info.addLayout(info_text, 1)
-        detail_layout.addLayout(info)
-        self.folder_label = label("", wrap=True)
-        self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        detail_layout.addWidget(self.folder_label)
-        self.stats_label = label("作品库待同步", "muted")
-        detail_layout.addWidget(self.stats_label)
-        self.updated_label = label("", "muted", True)
-        detail_layout.addWidget(self.updated_label)
-        buttons = QHBoxLayout()
-        self.edit_button = QPushButton("编辑资料 / 修改目录")
+        grid_header.addWidget(self.count_label)
+        grid_layout.addLayout(grid_header)
+        grid_scroll = QScrollArea()
+        grid_scroll.setWidgetResizable(True)
+        grid_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.actress_canvas = QWidget()
+        self.actress_grid = QGridLayout(self.actress_canvas)
+        self.actress_grid.setContentsMargins(4, 4, 4, 4)
+        self.actress_grid.setSpacing(14)
+        grid_scroll.setWidget(self.actress_canvas)
+        grid_layout.addWidget(grid_scroll, 1)
+        self.grid_empty = label("还没有女优资料。点击「添加女优」开始。", "muted", True)
+        grid_layout.addWidget(self.grid_empty)
+        self.stack.addWidget(self.grid_page)
+
+        self.detail_page = QWidget()
+        detail_layout = QVBoxLayout(self.detail_page)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(9)
+        actress_bar = QHBoxLayout()
+        self.back_button = QPushButton("← 返回女优")
+        self.back_button.clicked.connect(self.show_actress_grid)
+        actress_bar.addWidget(self.back_button)
+        self.detail_avatar = label("", "avatar")
+        self.detail_avatar.setFixedSize(44, 44)
+        self.detail_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        actress_bar.addWidget(self.detail_avatar)
+        self.detail_name = label("", "heading")
+        actress_bar.addWidget(self.detail_name)
+        self.detail_aliases = label("", "muted")
+        actress_bar.addWidget(self.detail_aliases, 1)
+        self.edit_button = QPushButton("编辑资料")
         self.edit_button.clicked.connect(lambda: self.edit_actress())
-        buttons.addWidget(self.edit_button)
-        open_button = QPushButton("打开本地文件夹")
-        open_button.clicked.connect(self.open_folder)
-        buttons.addWidget(open_button)
-        self.scan_button = QPushButton("扫描 / 本地文件")
-        self.scan_button.setObjectName("primary")
+        actress_bar.addWidget(self.edit_button)
+        detail_layout.addLayout(actress_bar)
+        self.collection_stats = label("作品库待同步", "compactstats")
+        detail_layout.addWidget(self.collection_stats)
+        work_bar = QHBoxLayout()
+        self.work_search = QLineEdit()
+        self.work_search.setPlaceholderText("筛选番号或标题")
+        self.work_search.textChanged.connect(self.render_movies)
+        work_bar.addWidget(self.work_search, 1)
+        self.work_filter = QComboBox()
+        self.work_filter.addItems(["全部状态", "已收藏", "缺少", "已忽略", "合集", "多人企划"])
+        self.work_filter.currentIndexChanged.connect(self.render_movies)
+        work_bar.addWidget(self.work_filter)
+        self.work_count = label("", "muted")
+        work_bar.addWidget(self.work_count)
+        detail_layout.addLayout(work_bar)
+        movie_scroll = QScrollArea()
+        movie_scroll.setWidgetResizable(True)
+        movie_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.movie_canvas = QWidget()
+        self.movie_grid = QGridLayout(self.movie_canvas)
+        self.movie_grid.setContentsMargins(4, 4, 4, 4)
+        self.movie_grid.setSpacing(12)
+        movie_scroll.setWidget(self.movie_canvas)
+        detail_layout.addWidget(movie_scroll, 1)
+        self.movie_empty = label("作品库尚未同步。点击下方「同步作品库」开始。", "muted", True)
+        detail_layout.addWidget(self.movie_empty)
+        self.movie_info = QFrame()
+        self.movie_info.setObjectName("card")
+        self.movie_info.setMaximumHeight(176)
+        info_layout = QVBoxLayout(self.movie_info)
+        info_layout.setContentsMargins(12, 9, 12, 8)
+        info_layout.setSpacing(4)
+        self.movie_title = label("选择作品封面查看资料", "subheading")
+        info_layout.addWidget(self.movie_title)
+        self.movie_meta = label("", "muted", True)
+        info_layout.addWidget(self.movie_meta)
+        self.movie_status = label("", "muted", True)
+        info_layout.addWidget(self.movie_status)
+        controls = QHBoxLayout()
+        self.scan_button = QPushButton("扫描本地文件")
         self.scan_button.clicked.connect(self.open_scan)
-        buttons.addWidget(self.scan_button)
-        sync_button = QPushButton("作品库 / 同步")
-        sync_button.clicked.connect(self.open_metadata)
-        buttons.addWidget(sync_button)
-        buttons.addStretch()
-        remove = QPushButton("移除")
-        remove.setObjectName("danger")
-        remove.clicked.connect(self.remove_actress)
-        buttons.addWidget(remove)
-        detail_layout.addLayout(buttons)
-        quick = QHBoxLayout()
-        missing_button = QPushButton("查看缺少作品")
-        missing_button.clicked.connect(lambda: self.open_metadata(2))
-        quick.addWidget(missing_button)
-        latest_button = QPushButton("查看最新作品")
-        latest_button.clicked.connect(lambda: self.open_metadata(4))
-        quick.addWidget(latest_button)
-        quick.addStretch()
-        detail_layout.addLayout(quick)
-        body.addWidget(self.detail)
+        controls.addWidget(self.scan_button)
+        self.sync_button = QPushButton("同步作品库")
+        self.sync_button.setObjectName("primary")
+        self.sync_button.clicked.connect(self.open_metadata)
+        controls.addWidget(self.sync_button)
+        self.missing_button = QPushButton("查看缺少")
+        self.missing_button.clicked.connect(lambda: self.open_metadata(2))
+        controls.addWidget(self.missing_button)
+        self.latest_button = QPushButton("查看最新")
+        self.latest_button.clicked.connect(lambda: self.open_metadata(4))
+        controls.addWidget(self.latest_button)
+        self.folder_button = QPushButton("打开目录")
+        self.folder_button.clicked.connect(self.open_folder)
+        controls.addWidget(self.folder_button)
+        self.remove_button = QPushButton("移除女优")
+        self.remove_button.setObjectName("danger")
+        self.remove_button.clicked.connect(self.remove_actress)
+        controls.addWidget(self.remove_button)
+        controls.addStretch()
+        info_layout.addLayout(controls)
+        detail_layout.addWidget(self.movie_info)
+        self.stack.addWidget(self.detail_page)
         self.statusBar().showMessage(f"本地数据库：{paths.database}")
         self.reload()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.check_auto_sync)
         self.refresh_timer.start(10 * 60 * 1000)
         QTimer.singleShot(2000, self.check_auto_sync)
+
+    def on_search_changed(self, _text):
+        if self.stack.currentWidget() is self.grid_page:
+            self.reload()
+        elif self.current:
+            self.work_search.blockSignals(True)
+            self.work_search.setText(self.search.text())
+            self.work_search.blockSignals(False)
+            self.render_movies()
+
+    def _clear_grid(self, grid):
+        while grid.count():
+            item = grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
     def reload(self, select_id: int | None = None):
         previous = select_id or (self.current.id if self.current else None)
@@ -220,151 +288,208 @@ class MainWindow(QMainWindow):
         except SQLAlchemyError:
             QMessageBox.critical(self, "读取失败", "无法读取数据库，请检查文件权限或稍后重试。")
             return
-        mode = self.sort.currentIndex()
-        if mode == 0:
-            self.rows.sort(key=lambda row: row.last_synced_at or row.updated_at, reverse=True)
-        elif mode == 1:
-            self.rows.sort(
-                key=lambda row: (
-                    self.summaries[row.id].completion_percent
-                    if self.summaries[row.id].completion_percent is not None
-                    else -1
-                ),
-                reverse=True,
-            )
-        elif mode == 2:
-            self.rows.sort(key=lambda row: self.summaries[row.id].total, reverse=True)
-        else:
-            self.rows.sort(key=lambda row: self.summaries[row.id].missing, reverse=True)
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(self.rows))
-        selected = 0
-        for index, row in enumerate(self.rows):
-            if row.id == previous:
-                selected = index
-            stats = self.summaries[row.id]
-            percent = (
-                f"{stats.completion_percent:.1f}%"
-                if stats.scanned and stats.completion_percent is not None
-                else "待扫描"
-                if not stats.scanned
-                else "—"
-            )
-            latest = stats.latest.movie.code if stats.latest else "—"
-            updated = row.last_synced_at or row.updated_at
-            values = (
-                row.name,
-                f"{stats.collected} / {stats.needed}" if row.last_synced_at else "待同步",
-                str(stats.missing) if stats.scanned and row.last_synced_at else "—",
-                percent if row.last_synced_at else "—",
-                latest,
-                updated.replace(tzinfo=UTC).astimezone().strftime("%Y-%m-%d"),
-                row.folder_path,
-            )
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setToolTip(value)
-                self.table.setItem(index, col, item)
-        self.table.blockSignals(False)
-        self.count_label.setText(f"{len(self.rows)} 位女优")
-        self.empty.setVisible(not self.rows)
-        self.empty.setText(
-            "没有匹配的女优。"
-            if self.search.text()
-            else "还没有女优资料。点击右上角「添加女优」开始。"
-        )
         if self.rows:
-            self.table.selectRow(selected)
-        self.select_row()
-
-    def select_row(self):
-        index = self.table.currentRow()
-        self.current = self.rows[index] if 0 <= index < len(self.rows) else None
-        self.detail.setVisible(self.current is not None)
-        if not self.current:
-            return
-        row = self.current
-        self.detail_name.setText(row.name)
-        self.detail_aliases.setText(
-            "日文名："
-            + (row.japanese_name or "未填写")
-            + "    别名："
-            + ("、".join(row.aliases) or "未填写")
-        )
-        self.avatar.clear()
-        pixmap = QPixmap(row.avatar_path) if row.avatar_path else QPixmap()
-        if not pixmap.isNull():
-            self.avatar.setPixmap(
-                pixmap.scaled(
-                    74,
-                    74,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        else:
-            self.avatar.setText(row.name[:1])
-        self.folder_label.setText(f"本地目录：{row.folder_path}")
-        if row.last_synced_at:
+            self.rows.sort(key=lambda row: row.last_synced_at or row.updated_at, reverse=True)
+        self._clear_grid(self.actress_grid)
+        columns = max(2, min(6, self.width() // 215))
+        for index, row in enumerate(self.rows):
+            card = QFrame()
+            card.setObjectName("photoCard")
+            card.setFixedSize(196, 248)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 10, 10, 9)
+            card_layout.setSpacing(5)
+            photo = QLabel()
+            photo.setObjectName("actressPhoto")
+            photo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            photo.setFixedSize(174, 158)
+            pixmap = QPixmap(row.avatar_path) if row.avatar_path else QPixmap()
+            if not pixmap.isNull():
+                photo.setPixmap(pixmap.scaled(photo.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            else:
+                photo.setText(row.name[:1])
+            card_layout.addWidget(photo)
+            card_layout.addWidget(label(row.name, "cardTitle"))
             stats = self.summaries[row.id]
-            percent = (
-                f"{stats.completion_percent:.1f}%"
-                if stats.scanned and stats.completion_percent is not None
-                else "待扫描"
-                if not stats.scanned
-                else "—"
-            )
-            newest = (
-                f"{stats.latest.movie.code}（{stats.latest.movie.release_date or '日期未知'}，"
-                f"{'已忽略' if stats.latest.is_ignored else '待扫描' if not stats.scanned else '已收藏' if stats.latest.local_paths else '未收藏'}）"
-                if stats.latest
-                else "暂无"
-            )
-            self.stats_label.setText(
-                f"单人作品 {stats.total} · 合集 {stats.compilations} · 多人企划 {stats.multi_actress}（不统计）· 忽略 {stats.ignored} · 已收藏 {stats.collected} · "
-                f"缺少 {stats.missing if stats.scanned else '待扫描'} · 完成度 {percent}\n"
-                f"最新作品：{newest} · 最近同步新增 {stats.new_count} 部"
-            )
-        else:
-            self.stats_label.setText("作品库待同步")
-        stamp = row.updated_at.replace(tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
-        scanned = (
-            row.last_scanned_at.replace(tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
-            if row.last_scanned_at
-            else "尚未扫描当前目录"
+            stats_text = f"{stats.collected} / {stats.needed} 已收藏" if row.last_synced_at else "尚未同步作品库"
+            card_layout.addWidget(label(stats_text, "muted"))
+            percent = f" · {stats.completion_percent:.1f}%" if stats.completion_percent is not None else ""
+            card_layout.addWidget(label(f"缺少 {stats.missing if stats.scanned else '—'}{percent}", "muted"))
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.mousePressEvent = lambda _event, actress=row: self.open_actress(actress)
+            self.actress_grid.addWidget(card, index // columns, index % columns)
+        self.count_label.setText(f"{len(self.rows)} 位女优")
+        self.grid_empty.setVisible(not self.rows)
+        if self.current and any(row.id == self.current.id for row in self.rows):
+            self.current = next(row for row in self.rows if row.id == self.current.id)
+            if self.stack.currentWidget() is self.detail_page:
+                self.open_actress(self.current, refresh=True)
+        elif not self.rows and self.stack.currentWidget() is self.detail_page:
+            self.show_actress_grid()
+        if previous is not None:
+            selected = next((row for row in self.rows if row.id == previous), None)
+            if selected:
+                self.current = selected
+
+    def show_actress_grid(self):
+        self.stack.setCurrentWidget(self.grid_page)
+        self.current = None
+
+    def open_actress(self, actress: Actress, refresh: bool = False):
+        try:
+            self.current = self.service.get(actress.id)
+        except SQLAlchemyError:
+            self.current = actress
+        self.stack.setCurrentWidget(self.detail_page)
+        self.detail_name.setText(self.current.name)
+        self.detail_aliases.setText(self.current.japanese_name or "")
+        avatar = QPixmap(self.current.avatar_path) if self.current.avatar_path else QPixmap()
+        self.detail_avatar.setPixmap(avatar.scaled(44, 44, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation) if not avatar.isNull() else QPixmap())
+        if avatar.isNull():
+            self.detail_avatar.setText(self.current.name[:1])
+        self.work_search.setText(self.search.text())
+        self.load_movies(self.current.id)
+
+    def load_movies(self, actress_id: int):
+        try:
+            matcher = MatchService(self.service.database)
+            self.movie_rows = matcher.views(actress_id)
+            summary = matcher.summary(actress_id, self.movie_rows)
+        except Exception as error:  # noqa: BLE001 -- UI boundary
+            self.statusBar().showMessage(f"无法加载作品：{error}", 7000)
+            return
+        percent = f"{summary.completion_percent:.1f}%" if summary.completion_percent is not None else "待扫描"
+        missing = summary.missing if summary.scanned else "待扫描"
+        latest = f"最新 {summary.latest.movie.code}" if summary.latest else "暂无最新作品"
+        self.collection_stats.setText(
+            f"作品 {summary.total}  ·  已收藏 {summary.collected}  ·  缺少 {missing}  ·  完成度 {percent}  ·  忽略 {summary.ignored}  ·  {latest}"
         )
-        self.updated_label.setText(f"资料更新：{stamp}    ·    最近成功扫描：{scanned}")
+        self.render_movies()
+
+    def render_movies(self, *_args):
+        if not hasattr(self, "movie_grid"):
+            return
+        query = self.work_search.text().casefold() if hasattr(self, "work_search") else ""
+        status_index = self.work_filter.currentIndex() if hasattr(self, "work_filter") else 0
+        status_values = ("", "collected", "missing", "ignored", "compilation", "multi_actress")
+        status_key = status_values[status_index]
+        rows = [
+            row for row in self.movie_rows
+            if query in f"{row.movie.code} {row.movie.title} {row.movie.japanese_title}".casefold()
+            and (not status_key or row.status == status_key)
+        ]
+        self._clear_grid(self.movie_grid)
+        columns = max(2, min(8, self.width() // 158))
+        needed_urls = []
+        for index, view in enumerate(rows):
+            card = QPushButton()
+            card.setObjectName("movieCard")
+            card.setProperty("selected", bool(self.selected_movie and self.selected_movie.movie.id == view.movie.id))
+            card.setFixedSize(142, 224)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            title = view.movie.title or view.movie.japanese_title or "作品标题未收录"
+            status = "已收藏" if view.local_paths else "已忽略" if view.is_ignored else "多人" if not view.is_solo else "合集" if view.is_compilation else "缺少"
+            cached = self.covers.cached(view.movie.cover_url)
+            if cached:
+                card.setIcon(QIcon(str(cached)))
+                card.setIconSize(QSize(124, 166))
+            else:
+                card.setText(f"封面\n未缓存\n\n{view.movie.code}")
+                if view.movie.cover_url:
+                    needed_urls.append(view.movie.cover_url)
+            card.setToolTip(f"{view.movie.code} · {title} · {status}")
+            card.clicked.connect(lambda checked=False, movie=view: self.select_movie(movie))
+            card.setStyleSheet(
+                "QPushButton#movieCard { text-align: center; padding: 5px; background: white; border: 1px solid #e1e7ef; border-radius: 9px; }"
+                "QPushButton#movieCard:hover, QPushButton#movieCard[selected='true'] { border: 2px solid #3267d6; background: #edf3ff; }"
+            )
+            tile = QWidget()
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(0, 0, 0, 0)
+            tile_layout.setSpacing(3)
+            tile_layout.addWidget(card)
+            tile_layout.addWidget(label(f"{view.movie.code}  ·  {status}", "tileMeta"))
+            self.movie_grid.addWidget(tile, index // columns, index % columns)
+        self.work_count.setText(f"{len(rows)} 部")
+        self.movie_empty.setVisible(not self.movie_rows)
+        if rows and (not self.selected_movie or all(self.selected_movie.movie.id != row.movie.id for row in rows)):
+            self.selected_movie = rows[0]
+            self.update_movie_info(rows[0])
+        if needed_urls and self.cover_worker is None:
+            pending = list(dict.fromkeys(url for url in needed_urls if not self.covers.cached(url)))[:12]
+            if pending:
+                self.cover_worker = CoverBatchWorker(self.covers, pending, self)
+                self.cover_worker.ready.connect(self.covers_ready, Qt.ConnectionType.QueuedConnection)
+                self.cover_worker.finished.connect(self.cover_batch_finished, Qt.ConnectionType.QueuedConnection)
+                self.cover_worker.finished.connect(self.cover_worker.deleteLater)
+                self.cover_worker.start()
+
+    @Slot(dict)
+    def covers_ready(self, covers: dict):
+        self.cover_paths.update({url: path for url, path in covers.items() if path})
+        self.render_movies()
+
+    @Slot()
+    def cover_batch_finished(self):
+        self.cover_worker = None
+        self.render_movies()
+
+    def select_movie(self, view: MovieView):
+        self.selected_movie = view
+        self.update_movie_info(view)
+        self.render_movies()
+
+    def update_movie_info(self, view: MovieView):
+        movie = view.movie
+        self.movie_title.setText(f"{movie.code}  ·  {movie.title or movie.japanese_title or '作品标题未收录'}")
+        self.movie_meta.setText(
+            f"发行日期：{movie.release_date or '未知'}  ·  制作商：{movie.manufacturer or '未知'}  ·  系列：{movie.series or '—'}"
+        )
+        state = "已收藏" if view.local_paths else "已忽略" if view.is_ignored else "多人企划（不统计）" if not view.is_solo else "合集（不统计）" if view.is_compilation else "缺少"
+        local = "\n本地文件：" + "；".join(view.local_paths) if view.local_paths else ""
+        self.movie_status.setText(f"状态：{state}{local}")
+
+    def global_update(self):
+        if self.auto_worker:
+            return
+        self.auto_worker = GlobalUpdateWorker(AutomaticSyncService(self.service.database), self)
+        self.auto_worker.finished.connect(self.global_update_finished, Qt.ConnectionType.QueuedConnection)
+        self.global_button.setEnabled(False)
+        self.global_button.setText("正在更新…")
+        self.statusBar().showMessage("正在更新所有已绑定的数据源…")
+        self.auto_worker.start()
+
+    @Slot()
+    def global_update_finished(self):
+        worker = self.auto_worker
+        if worker is None:
+            return
+        worker.wait()
+        self.auto_worker = None
+        done, failed = worker.result
+        self.global_button.setEnabled(True)
+        self.global_button.setText("↻ 全局更新")
+        self.reload(self.current.id if self.current else None)
+        self.statusBar().showMessage(f"全局更新完成：成功 {done} 项，失败 {failed} 项。", 10000)
 
     def open_scan(self):
         if not self.current:
             return
-        try:
-            dialog = ScanDialog(ScanService(self.service.database), self.current, self)
-            dialog.exec()
-            self.reload(self.current.id)
-        except SQLAlchemyError:
-            QMessageBox.warning(self, "无法读取文件库", "数据库访问失败，请稍后重试。")
+        dialog = ScanDialog(ScanService(self.service.database), self.current, self)
+        dialog.exec()
+        self.reload(self.current.id)
 
     def open_metadata(self, filter_index: int = 0):
         if not self.current:
             return
-        try:
-            dialog = MetadataDialog(
-                MetadataService(self.service.database),
-                self.current,
-                self,
-                cover_dir=self.paths.covers,
-            )
-            dialog.filter.setCurrentIndex(filter_index)
-            dialog.exec()
-            self.reload(self.current.id)
-        except SQLAlchemyError:
-            QMessageBox.warning(self, "无法读取作品库", "数据库访问失败，请稍后重试。")
+        dialog = MetadataDialog(MetadataService(self.service.database), self.current, self, cover_dir=self.paths.covers)
+        dialog.filter.setCurrentIndex(filter_index)
+        dialog.exec()
+        self.reload(self.current.id)
 
     def open_global_search(self):
-        dialog = SearchDialog(SearchService(self.service.database), self, self.paths.covers)
-        dialog.exec()
-        self.reload()
+        SearchDialog(SearchService(self.service.database), self, self.paths.covers).exec()
+        self.reload(self.current.id if self.current else None)
 
     def edit_actress(self, new: bool = False):
         if not new and self.current is None:
@@ -378,13 +503,7 @@ class MainWindow(QMainWindow):
     def remove_actress(self):
         if not self.current:
             return
-        answer = QMessageBox.question(
-            self,
-            "移除女优资料",
-            "确定移除所选女优资料？\n仅移除数据库记录，本地文件和文件夹会保留。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        answer = QMessageBox.question(self, "移除女优资料", "确定移除所选女优资料？\n仅移除数据库记录，本地文件和文件夹会保留。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
@@ -399,19 +518,12 @@ class MainWindow(QMainWindow):
         if not self.current:
             return
         path = Path(self.current.folder_path)
-        try:
-            if not path.is_dir():
-                raise OSError("目录不存在或磁盘未连接，请检查路径。")
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
-                raise OSError("无法打开资源管理器。")
-        except OSError as error:
-            QMessageBox.warning(self, "无法打开文件夹", str(error))
+        if path.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            QMessageBox.warning(self, "无法打开文件夹", "目录不存在或磁盘未连接，请检查路径。")
 
     def show_storage(self):
-        if self.auto_worker:
-            self.auto_worker.cancel.set()
-            self.auto_worker.wait()
-            self.auto_worker = None
         service = BackupService(self.service.database, self.paths.database, self.paths.backups)
         dialog = BackupDialog(service, self)
         dialog.exec()
@@ -427,28 +539,11 @@ class MainWindow(QMainWindow):
     def check_auto_sync(self):
         if self.auto_worker or SettingsService(self.service.database).update_interval_hours() == 0:
             return
-        self.auto_worker = AutomaticSyncWorker(AutomaticSyncService(self.service.database), self)
-        self.auto_worker.finished.connect(
-            self.auto_sync_finished, Qt.ConnectionType.QueuedConnection
-        )
-        self.auto_worker.start()
-
-    @Slot()
-    def auto_sync_finished(self):
-        worker = self.auto_worker
-        if worker is None or self.sender() is not worker:
-            return
-        worker.wait()
-        self.auto_worker = None
-        done, failed = worker.result
-        if done or failed:
-            self.statusBar().showMessage(f"自动更新完成：成功 {done} 位，失败 {failed} 位。", 10000)
-            self.reload()
+        self.global_update()
 
     def closeEvent(self, event):
         self.refresh_timer.stop()
-        if self.auto_worker:
-            self.auto_worker.cancel.set()
-            self.auto_worker.wait()
-            self.auto_worker = None
+        for worker in (self.auto_worker, self.cover_worker):
+            if worker and worker.isRunning():
+                worker.wait()
         event.accept()

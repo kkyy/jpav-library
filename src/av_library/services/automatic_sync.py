@@ -21,9 +21,9 @@ class AutomaticSyncService:
     def __init__(self, database: Database):
         self.database = database
 
-    def run_due(self, cancel: Event) -> tuple[int, int]:
+    def run_due(self, cancel: Event, force: bool = False) -> tuple[int, int]:
         hours = SettingsService(self.database).update_interval_hours()
-        if hours == 0:
+        if hours == 0 and not force:
             return 0, 0
         providers = {
             "s1_public": S1PublicProvider(),
@@ -50,7 +50,7 @@ class AutomaticSyncService:
                     .order_by(SyncHistory.id.desc())
                     .limit(1)
                 )
-                if latest is None or latest + timedelta(hours=hours) <= now:
+                if force or latest is None or latest + timedelta(hours=hours) <= now:
                     due.append((actress_id, provider_id))
         done = failed = 0
         for actress_id, provider_id in due:
