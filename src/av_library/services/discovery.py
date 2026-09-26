@@ -9,6 +9,7 @@ from av_library.db.models import Actress
 from av_library.providers.actress_names import name_key, search_names
 from av_library.providers.contracts import MovieProvider
 from av_library.providers.dmm import DmmProvider, ProviderError
+from av_library.providers.ideapocket_public import IdeaPocketPublicProvider
 from av_library.providers.s1_public import S1PublicProvider
 from av_library.services.actresses import ActressService
 from av_library.services.metadata_sync import MetadataService, SyncProgress
@@ -40,7 +41,7 @@ class SoloCatalogDiscoveryService:
         self.metadata = metadata
 
     def _available_providers(self) -> tuple[MovieProvider, ...]:
-        providers: list[MovieProvider] = [S1PublicProvider()]
+        providers: list[MovieProvider] = [S1PublicProvider(), IdeaPocketPublicProvider()]
         with suppress(ProviderError):
             providers.append(DmmProvider())
         return tuple(providers)

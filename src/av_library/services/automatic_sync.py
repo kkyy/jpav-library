@@ -9,6 +9,7 @@ from sqlalchemy import select
 from av_library.db.database import Database
 from av_library.db.models import Actress, ActressSource, SyncHistory
 from av_library.providers.dmm import DmmProvider, ProviderError
+from av_library.providers.ideapocket_public import IdeaPocketPublicProvider
 from av_library.providers.s1_public import S1PublicProvider
 from av_library.services.metadata_sync import MetadataService
 from av_library.services.settings import SettingsService
@@ -24,7 +25,10 @@ class AutomaticSyncService:
         hours = SettingsService(self.database).update_interval_hours()
         if hours == 0:
             return 0, 0
-        providers = {"s1_public": S1PublicProvider()}
+        providers = {
+            "s1_public": S1PublicProvider(),
+            "ideapocket_public": IdeaPocketPublicProvider(),
+        }
         try:
             providers["dmm"] = DmmProvider()
         except ProviderError:

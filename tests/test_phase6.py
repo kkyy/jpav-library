@@ -70,11 +70,15 @@ def test_opt_in_automatic_sync_only_runs_due_bound_source(database, tmp_path, mo
     assert len(MetadataService(database).movies(actress.id)) == 1
 
 
-def test_periodic_sync_can_refresh_bound_s1_without_dmm_credentials(
-    database, tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("provider_id", "provider_class"),
+    [("s1_public", "S1PublicProvider"), ("ideapocket_public", "IdeaPocketPublicProvider")],
+)
+def test_periodic_sync_can_refresh_bound_public_source_without_dmm_credentials(
+    database, tmp_path, monkeypatch, provider_id, provider_class
 ):
     class Provider:
-        id = "s1_public"
+        id = provider_id
         display_name = "test S1"
         coverage_description = "fixture"
 
@@ -90,7 +94,9 @@ def test_periodic_sync_can_refresh_bound_s1_without_dmm_credentials(
         actress.id, provider, ProviderActress(provider.id, "813682", "つばさ舞")
     )
     SettingsService(database).save_update_interval(24)
-    monkeypatch.setattr("av_library.services.automatic_sync.S1PublicProvider", lambda: provider)
+    monkeypatch.setattr(
+        f"av_library.services.automatic_sync.{provider_class}", lambda: provider
+    )
     monkeypatch.setattr(
         "av_library.services.automatic_sync.DmmProvider",
         lambda: (_ for _ in ()).throw(ProviderError("missing")),
