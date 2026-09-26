@@ -1,8 +1,9 @@
+from datetime import date
 from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -423,10 +424,17 @@ class MainWindow(QMainWindow):
             poster.setObjectName("posterImage")
             poster.setFixedSize(poster_width, round(poster_width * 1.5))
             poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            missing = view.status == "missing"
+            upcoming = bool(missing and view.movie.release_date and view.movie.release_date > date.today())
+            poster.setProperty("upcoming", upcoming)
             poster_url = view.movie.cover_url
             cached = self.covers.cached(view.movie.cover_url)
             if cached:
-                poster.setPixmap(self._crop_poster(cached, poster.size()))
+                pixmap = self._crop_poster(cached, poster.size())
+                if missing:
+                    grayscale = pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+                    pixmap = QPixmap.fromImage(grayscale)
+                poster.setPixmap(pixmap)
             else:
                 poster.setText(view.movie.code if poster_url else "暂无封面")
                 if poster_url:
