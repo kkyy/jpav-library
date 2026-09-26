@@ -15,7 +15,7 @@ QLabel#actressPhoto { background: #30343a; border-radius: 8px; color: #c1c9bd; f
 QLabel#cardTitle { font-size: 15px; font-weight: 600; color: #f4f4f2; }
 QLabel#tileMeta { color: #d0d2d3; font-size: 11px; }
 QLabel#posterImage { background: #292c31; color: #c0c2c4; border: none; font-size: 13px; }
-QLabel#posterImage[upcoming='true'] { border: 3px solid #66d18c; }
+QLabel#posterImage[upcoming='true'] { border: 5px solid #55ff75; }
 QFrame#posterCard { background: transparent; border: 2px solid transparent; border-radius: 6px; }
 QFrame#posterCard:hover { background: #252a29; border-color: #62725d; }
 QFrame#posterCard[selected='true'] { background: #292f2b; border-color: #849579; }
