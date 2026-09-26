@@ -58,7 +58,7 @@ class SettingsDialog(QDialog):
         form.addRow("自动更新间隔", self.interval)
         layout.addLayout(form)
         note = QLabel(
-            "自动更新只尝试已确认身份的 DMM 来源；需要有效 API 凭据。首次运行按当前间隔检查。"
+            "自动更新会刷新已绑定的 S1 来源；DMM 来源需已绑定并配置 API 凭据。首次运行按当前间隔检查。"
         )
         note.setObjectName("notice")
         note.setWordWrap(True)

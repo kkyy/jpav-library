@@ -26,6 +26,7 @@ from av_library.providers.dmm import DmmProvider, ProviderError
 from av_library.providers.file_import import FileCatalogProvider
 from av_library.providers.s1_public import S1PublicProvider
 from av_library.services.covers import CoverService
+from av_library.services.discovery import SoloCatalogDiscoveryService
 from av_library.services.matching import MatchService
 from av_library.services.metadata_sync import MetadataService, SyncProgress
 
@@ -65,36 +66,44 @@ class MetadataDialog(QDialog):
         title = QLabel(f"{actress.name} · 作品元数据")
         title.setObjectName("heading")
         layout.addWidget(title)
-        tip = QLabel("作品来源有各自的收录范围；列表数量代表已收录记录，不保证覆盖全部发行作品。")
+        tip = QLabel(
+            "自动检索请先在女优管理填写准确日文名。每个来源只覆盖自己的目录；单人统计不保证跨片商全部发行作品。"
+        )
         tip.setObjectName("notice")
         tip.setWordWrap(True)
         layout.addWidget(tip)
         buttons = QHBoxLayout()
+        self.discovery_button = QPushButton("自动检索单人作品")
+        self.discovery_button.setObjectName("primary")
+        self.discovery_button.clicked.connect(self.discover_solo_catalog)
+        buttons.addWidget(self.discovery_button)
         self.import_button = QPushButton("导入 JSON / CSV")
-        self.import_button.setObjectName("primary")
         self.import_button.clicked.connect(self.choose_import)
         buttons.addWidget(self.import_button)
-        self.bind_button = QPushButton("查找并绑定 DMM 身份")
-        self.bind_button.clicked.connect(self.search_dmm)
-        buttons.addWidget(self.bind_button)
-        self.sync_button = QPushButton("更新 DMM 作品库")
-        self.sync_button.clicked.connect(self.sync_dmm)
-        buttons.addWidget(self.sync_button)
-        self.s1_bind_button = QPushButton("绑定 S1 官网身份")
-        self.s1_bind_button.clicked.connect(self.search_s1)
-        buttons.addWidget(self.s1_bind_button)
-        self.s1_sync_button = QPushButton("更新 S1 官网目录")
-        self.s1_sync_button.clicked.connect(self.sync_s1)
-        buttons.addWidget(self.s1_sync_button)
-        self.s1_adjacent_button = QPushButton("S1 邻号补查")
-        self.s1_adjacent_button.clicked.connect(self.sync_s1_adjacent)
-        buttons.addWidget(self.s1_adjacent_button)
         self.cancel_button = QPushButton("取消任务")
         self.cancel_button.clicked.connect(self.cancel_task)
         self.cancel_button.setEnabled(False)
         buttons.addWidget(self.cancel_button)
         buttons.addStretch()
         layout.addLayout(buttons)
+        advanced = QHBoxLayout()
+        self.bind_button = QPushButton("查找并绑定 DMM 身份")
+        self.bind_button.clicked.connect(self.search_dmm)
+        advanced.addWidget(self.bind_button)
+        self.sync_button = QPushButton("更新 DMM 作品库")
+        self.sync_button.clicked.connect(self.sync_dmm)
+        advanced.addWidget(self.sync_button)
+        self.s1_bind_button = QPushButton("绑定 S1 官网身份")
+        self.s1_bind_button.clicked.connect(self.search_s1)
+        advanced.addWidget(self.s1_bind_button)
+        self.s1_sync_button = QPushButton("更新 S1 官网目录")
+        self.s1_sync_button.clicked.connect(self.sync_s1)
+        advanced.addWidget(self.s1_sync_button)
+        self.s1_adjacent_button = QPushButton("S1 邻号补查")
+        self.s1_adjacent_button.clicked.connect(self.sync_s1_adjacent)
+        advanced.addWidget(self.s1_adjacent_button)
+        advanced.addStretch()
+        layout.addLayout(advanced)
         self.sources = QLabel()
         self.sources.setTextFormat(Qt.TextFormat.PlainText)
         self.sources.setWordWrap(True)
@@ -110,7 +119,16 @@ class MetadataDialog(QDialog):
         filters.addWidget(self.search, 1)
         self.filter = QComboBox()
         self.filter.addItems(
-            ["全部", "已收藏", "缺少", "已忽略", "合集（不统计）", "多人企划（不统计）", "最新作品"]
+            [
+                "全部",
+                "已收藏",
+                "缺少",
+                "已忽略",
+                "合集（不统计）",
+                "多人企划（不统计）",
+                "最新作品",
+                "单人作品",
+            ]
         )
         self.filter.currentIndexChanged.connect(self.render_rows)
         filters.addWidget(self.filter)
@@ -162,6 +180,7 @@ class MetadataDialog(QDialog):
         close_row.addWidget(close)
         layout.addLayout(close_row)
         self.reload()
+        self.filter.setCurrentText("单人作品")
 
     def reload(self):
         self.rows = self.matches.views(self.actress.id)
@@ -238,6 +257,7 @@ class MetadataDialog(QDialog):
                 or (mode == 4 and row.status == "compilation")
                 or (mode == 5 and row.status == "multi_actress")
                 or (mode == 6 and index < 20)
+                or (mode == 7 and row.is_solo and not row.is_compilation)
             )
         ]
         self.visible_rows = rows
@@ -363,6 +383,13 @@ class MetadataDialog(QDialog):
             "search", lambda _cancel, _progress: provider.search_actresses(name), provider
         )
 
+    def discover_solo_catalog(self):
+        discovery = SoloCatalogDiscoveryService(self.service)
+        self.start_task(
+            "discover",
+            lambda cancel, progress: discovery.run(self.actress, cancel, progress),
+        )
+
     def sync_dmm(self):
         try:
             provider = DmmProvider()
@@ -384,8 +411,8 @@ class MetadataDialog(QDialog):
     def search_s1(self):
         url, accepted = QInputDialog.getText(
             self,
-            "S1 官网女优资料页",
-            "粘贴该女优的 S1 官网资料页 HTTPS 地址：",
+            "查找 S1 官网女优身份",
+            "输入日文名，或粘贴 S1 官网资料页 HTTPS 地址：",
         )
         if accepted and url.strip():
             provider = S1PublicProvider()
@@ -430,6 +457,7 @@ class MetadataDialog(QDialog):
         self.worker.progress.connect(self.update_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.finished.connect(self.task_finished, Qt.ConnectionType.QueuedConnection)
         for button in (
+            self.discovery_button,
             self.import_button,
             self.bind_button,
             self.sync_button,
@@ -463,6 +491,7 @@ class MetadataDialog(QDialog):
         # Deferred deletion during nested Qt event loops can race queued callbacks.
         self.worker = None
         for button in (
+            self.discovery_button,
             self.import_button,
             self.bind_button,
             self.sync_button,
@@ -490,6 +519,8 @@ class MetadataDialog(QDialog):
             self.reload()
         except Exception as problem:  # noqa: BLE001 -- UI boundary
             error = str(problem)
+        if self.operation == "discover" and result and not self.close_pending:
+            self.status.setText("自动检索：" + result.summary())
         if error and not self.close_pending:
             self.show_error(error)
         self.show_cover()

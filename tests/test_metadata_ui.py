@@ -3,6 +3,7 @@ import json
 from PySide6.QtCore import QEventLoop, QTimer
 
 from av_library.services.actresses import ActressInput, ActressService
+from av_library.services.discovery import DiscoveryReport, SourceDiscovery
 from av_library.services.metadata_sync import MetadataService
 from av_library.ui.metadata_dialog import MetadataDialog
 
@@ -66,4 +67,23 @@ def test_invalid_import_does_not_bind_source(database, tmp_path, qapp):
     wait_for_task(dialog)
     assert errors and service.bindings(actress.id) == []
     assert service.movies(actress.id) == []
+    dialog.close()
+
+
+def test_auto_discovery_button_reports_source_scope(database, tmp_path, qapp, monkeypatch):
+    actress = ActressService(database).save(
+        ActressInput("翼舞", str(tmp_path / "videos"), japanese_name="つばさ舞")
+    )
+    seen = []
+
+    def discover(_self, selected, _cancel, _progress):
+        seen.append(selected.japanese_name)
+        return DiscoveryReport((SourceDiscovery("S1 官网", "success", "读取 105 条"),))
+
+    monkeypatch.setattr("av_library.ui.metadata_dialog.SoloCatalogDiscoveryService.run", discover)
+    dialog = MetadataDialog(MetadataService(database), actress)
+    dialog.discovery_button.click()
+    wait_for_task(dialog)
+    assert seen == ["つばさ舞"]
+    assert "S1 官网：读取 105 条" in dialog.status.text()
     dialog.close()

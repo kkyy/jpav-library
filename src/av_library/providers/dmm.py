@@ -113,6 +113,18 @@ class DmmProvider:
             value = value[0] if value else None
         return str(value.get("name")) if isinstance(value, dict) and value.get("name") else None
 
+    @staticmethod
+    def _actress_ids(raw: dict, code: str) -> tuple[str, ...]:
+        info = raw.get("iteminfo")
+        actresses = info.get("actress") if isinstance(info, dict) else None
+        if isinstance(actresses, dict):
+            actresses = [actresses]
+        if not isinstance(actresses, list) or not actresses:
+            raise ProviderError(f"{code} 缺少出演者名单，无法判断是否单人作品")
+        if any(not isinstance(item, dict) or not item.get("id") for item in actresses):
+            raise ProviderError(f"{code} 出演者名单格式无效")
+        return tuple(dict.fromkeys(str(item["id"]) for item in actresses))
+
     def _map_item(self, raw: dict, actress_external_id: str | None = None) -> MovieMetadata:
         if not isinstance(raw, dict):
             raise ProviderError("存在非对象作品条目。")
@@ -126,8 +138,12 @@ class DmmProvider:
         source_id = str(raw.get("content_id") or "")
         if not source_id:
             raise ProviderError(f"{code} 缺少来源 ID")
+        actress_ids = self._actress_ids(raw, code)
+        if actress_external_id and actress_external_id not in actress_ids:
+            raise ProviderError(f"{code} 未列出当前女优，无法确认作品归属")
         image = raw.get("imageURL") or {}
         title = str(raw.get("title") or "")
+        info = raw.get("iteminfo") or {}
         return MovieMetadata(
             self.id,
             source_id,
@@ -135,13 +151,14 @@ class DmmProvider:
             title,
             japanese_title=title,
             release_date=release,
-            manufacturer=self._name(raw.get("maker")),
-            publisher=self._name(raw.get("label")),
-            series=self._name(raw.get("series")),
+            manufacturer=self._name(info.get("maker") or raw.get("maker")),
+            publisher=self._name(info.get("label") or raw.get("label")),
+            series=self._name(info.get("series") or raw.get("series")),
             cover_url=image.get("large") if isinstance(image, dict) else None,
             detail_url=raw.get("URL"),
-            actress_external_ids=(actress_external_id,) if actress_external_id else (),
+            actress_external_ids=actress_ids,
             is_compilation=infer_compilation_title(title),
+            is_solo=len(actress_ids) == 1,
         )
 
     def get_movie(self, external_id: str) -> MovieMetadata:

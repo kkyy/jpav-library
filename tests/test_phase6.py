@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from av_library.db.models import Actress
 from av_library.providers.contracts import MovieMetadata, MoviePage, ProviderActress
+from av_library.providers.dmm import ProviderError
 from av_library.services.actresses import ActressInput, ActressService
 from av_library.services.automatic_sync import AutomaticSyncService
 from av_library.services.backups import BackupError, BackupService
@@ -67,3 +68,33 @@ def test_opt_in_automatic_sync_only_runs_due_bound_source(database, tmp_path, mo
     assert automatic.run_due(Event()) == (1, 0)
     assert automatic.run_due(Event()) == (0, 0)
     assert len(MetadataService(database).movies(actress.id)) == 1
+
+
+def test_periodic_sync_can_refresh_bound_s1_without_dmm_credentials(
+    database, tmp_path, monkeypatch
+):
+    class Provider:
+        id = "s1_public"
+        display_name = "test S1"
+        coverage_description = "fixture"
+
+        def list_movies(self, actress_external_id, cursor=None):
+            assert actress_external_id == "813682"
+            return MoviePage(
+                (MovieMetadata(self.id, "SONE341", "SONE-341", "作品"),), None, True, 1
+            )
+
+    provider = Provider()
+    actress = ActressService(database).save(ActressInput("翼舞", str(tmp_path / "videos")))
+    MetadataService(database).bind(
+        actress.id, provider, ProviderActress(provider.id, "813682", "つばさ舞")
+    )
+    SettingsService(database).save_update_interval(24)
+    monkeypatch.setattr("av_library.services.automatic_sync.S1PublicProvider", lambda: provider)
+    monkeypatch.setattr(
+        "av_library.services.automatic_sync.DmmProvider",
+        lambda: (_ for _ in ()).throw(ProviderError("missing")),
+    )
+    automatic = AutomaticSyncService(database)
+    assert automatic.run_due(Event()) == (1, 0)
+    assert automatic.run_due(Event()) == (0, 0)

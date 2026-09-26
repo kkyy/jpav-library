@@ -2,12 +2,13 @@
 
 import html
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from http.client import IncompleteRead
 from time import sleep
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from av_library.parsing.codes import CodeParser
@@ -31,10 +32,15 @@ _CARD = re.compile(
     re.S,
 )
 _COVER = re.compile(r'<img[^>]+data-src="(https://[^\"]+)"')
-_TITLE = re.compile(r'<title>(.*?)</title>', re.S | re.I)
+_TITLE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
 _DATE = re.compile(r"/works/list/date/(\d{4}-\d{2}-\d{2})")
 _TAG = re.compile(r"<[^>]+>")
 _ACTRESS_LINK = re.compile(r"/actress/detail/(\d+)")
+_SEARCH_ACTRESS = re.compile(
+    r'<a class="name[^\"]*" href="https://s1s1s1\.com/actress/detail/(?P<id>\d+)"'
+    r"[^>]*>(?P<name>.*?)</a>",
+    re.S,
+)
 _CODE = re.compile(r"^(?P<prefix>[A-Z]{2,10})-?(?P<number>\d{2,7})$")
 
 
@@ -48,6 +54,20 @@ def profile_id_from_url(value: str) -> str:
 
 def _plain(value: str) -> str:
     return " ".join(html.unescape(_TAG.sub("", value)).split())
+
+
+def _name_key(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def parse_actress_search(source: str, query: str) -> tuple[tuple[str, str], ...]:
+    key = _name_key(query)
+    found: dict[str, str] = {}
+    for match in _SEARCH_ACTRESS.finditer(source):
+        name = _plain(match["name"])
+        if _name_key(name) == key:
+            found[match["id"]] = name
+    return tuple(found.items())
 
 
 def is_compilation_title(title: str) -> bool:
@@ -98,6 +118,10 @@ def parse_detail(
     except ValueError as error:
         raise S1ProviderError(f"S1 作品 {raw_code} 的番号或发行日期无效。") from error
     actress_ids = _detail_actress_ids(source)
+    if not actress_ids:
+        raise S1ProviderError(f"S1 作品 {raw_code} 的出演者名单不可用，无法判断是否单人作品。")
+    if actress_external_id and actress_external_id not in actress_ids:
+        raise S1ProviderError(f"S1 作品 {raw_code} 未列出当前女优，无法确认作品归属。")
     return MovieMetadata(
         provider_id="s1_public",
         external_id=raw_code,
@@ -110,7 +134,7 @@ def parse_detail(
         detail_url=f"https://s1s1s1.com/works/detail/{raw_code}",
         is_compilation=is_compilation_title(japanese_title),
         actress_external_ids=actress_ids,
-        is_solo=len(actress_ids) == 1 if actress_ids else True,
+        is_solo=len(actress_ids) == 1,
     )
 
 
@@ -150,9 +174,18 @@ class S1PublicProvider:
         raise S1ProviderError("无法读取 S1 官网公开元数据，请稍后重试。")
 
     def search_actresses(self, query: str) -> tuple[ProviderActress, ...]:
-        actress_id = profile_id_from_url(query)
-        name, _, _ = parse_profile(self._get(f"/actress/detail/{actress_id}"))
-        return (ProviderActress(self.id, actress_id, name, japanese_name=name),)
+        query = query.strip()
+        if not query or len(query) > 200:
+            raise S1ProviderError("请输入女优日文名或 S1 官网资料页地址。")
+        if "://" in query:
+            actress_id = profile_id_from_url(query)
+            name, _, _ = parse_profile(self._get(f"/actress/detail/{actress_id}"))
+            return (ProviderActress(self.id, actress_id, name, japanese_name=name),)
+        source = self._get(f"/search/list?keyword={quote(query, safe='')}")
+        return tuple(
+            ProviderActress(self.id, actress_id, name, japanese_name=name)
+            for actress_id, name in parse_actress_search(source, query)
+        )
 
     def list_movies(self, actress_external_id: str, cursor: str | None = None) -> MoviePage:
         if not actress_external_id.isdecimal():
@@ -161,10 +194,9 @@ class S1PublicProvider:
         if page_number < 1 or page_number > 500:
             raise S1ProviderError("S1 分页超过支持范围。")
         suffix = f"?page={page_number}" if page_number > 1 else ""
-        _, total, cards = parse_profile(
-            self._get(f"/actress/detail/{actress_external_id}{suffix}")
-        )
+        _, total, cards = parse_profile(self._get(f"/actress/detail/{actress_external_id}{suffix}"))
         self._known_codes.update(raw_code for raw_code, _ in cards)
+
         def fetch_card(card: tuple[str, str | None]) -> MovieMetadata:
             raw_code, cover = card
             return parse_detail(

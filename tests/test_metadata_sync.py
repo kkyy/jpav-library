@@ -195,6 +195,7 @@ def test_dmm_response_mapping_and_secret_free_errors(monkeypatch):
                         "title": "Test",
                         "date": "2026-09-01",
                         "maker": [{"name": "Maker"}],
+                        "iteminfo": {"actress": [{"id": 123, "name": "Test Actress"}]},
                         "imageURL": {"large": "https://example.com/cover.jpg"},
                     }
                 ],
@@ -208,6 +209,7 @@ def test_dmm_response_mapping_and_secret_free_errors(monkeypatch):
     assert page.complete and page.items[0].code == "MIDV-123"
     assert page.items[0].manufacturer == "Maker"
     assert provider.get_movie("midv00123").code == "MIDV-123"
+    assert page.items[0].is_solo
     from urllib.error import HTTPError
 
     def denied(_request, timeout):
@@ -217,6 +219,28 @@ def test_dmm_response_mapping_and_secret_free_errors(monkeypatch):
     with pytest.raises(ProviderError) as raised:
         DmmProvider("secret-api", "secret-affiliate")._request("ItemList", {})
     assert "secret-api" not in str(raised.value)
+
+
+def test_dmm_solo_classification_uses_complete_cast_not_query_id():
+    provider = DmmProvider("api", "affiliate")
+    row = {
+        "content_id": "midv00123",
+        "product_id": "MIDV-123",
+        "title": "Example",
+        "iteminfo": {
+            "actress": [
+                {"id": 123, "name": "First"},
+                {"id": 456, "name": "Second"},
+            ]
+        },
+    }
+    movie = provider._map_item(row, "123")
+    assert movie.actress_external_ids == ("123", "456")
+    assert not movie.is_solo
+    with pytest.raises(ProviderError, match="未列出当前女优"):
+        provider._map_item(row, "999")
+    with pytest.raises(ProviderError, match="缺少出演者名单"):
+        provider._map_item({**row, "iteminfo": {}}, "123")
 
 
 def test_v2_database_upgrade_preserves_scan_and_manual_code(tmp_path):
