@@ -39,6 +39,18 @@ class CatalogProvider:
         raise NotImplementedError
 
 
+class ChineseNameProvider(CatalogProvider):
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+
+    def search_actresses(self, query):
+        self.queries.append(query)
+        if query == "つばさ舞":
+            return (ProviderActress(self.id, "813682", "つばさ舞", japanese_name="つばさ舞"),)
+        return ()
+
+
 def test_discovery_auto_binds_exact_actress_and_counts_only_solo(database, tmp_path):
     actress = ActressService(database).save(
         ActressInput("翼舞", str(tmp_path / "videos"), japanese_name="つばさ舞")
@@ -72,3 +84,13 @@ def test_discovery_does_not_bind_fuzzy_or_ambiguous_identity(database, tmp_path)
     result = SoloCatalogDiscoveryService(metadata).run(actress, providers=[provider])
     assert result.sources[0].status == "ambiguous"
     assert metadata.bindings(actress.id) == []
+
+
+def test_discovery_resolves_chinese_name_and_persists_japanese_name(database, tmp_path):
+    actress = ActressService(database).save(ActressInput("翼舞", str(tmp_path / "videos")))
+    metadata = MetadataService(database)
+    provider = ChineseNameProvider()
+    result = SoloCatalogDiscoveryService(metadata).run(actress, providers=[provider])
+    assert result.successful_sources == 1
+    assert provider.queries == ["翼舞", "つばさ舞"]
+    assert ActressService(database).get(actress.id).japanese_name == "つばさ舞"

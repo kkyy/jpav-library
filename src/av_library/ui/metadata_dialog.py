@@ -67,7 +67,7 @@ class MetadataDialog(QDialog):
         title.setObjectName("heading")
         layout.addWidget(title)
         tip = QLabel(
-            "自动检索请先在女优管理填写准确日文名。每个来源只覆盖自己的目录；单人统计不保证跨片商全部发行作品。"
+            "自动检索支持中文名；程序会尝试补全日文名。每个来源只覆盖自己的目录；单人统计不保证跨片商全部发行作品。"
         )
         tip.setObjectName("notice")
         tip.setWordWrap(True)

@@ -64,6 +64,21 @@ class ActressService:
                 raise ValidationError("该女优记录已不存在，请刷新列表。")
             return row
 
+    def set_japanese_name(self, actress_id: int, japanese_name: str) -> Actress:
+        japanese_name = japanese_name.strip()
+        if not japanese_name or len(japanese_name) > 100 or "\x00" in japanese_name:
+            raise ValidationError("自动识别到的日文名无效。")
+        now = datetime.now(UTC).replace(tzinfo=None)
+        with self.database.sessions.begin() as session:
+            row = session.get(Actress, actress_id)
+            if row is None:
+                raise ValidationError("该女优记录已不存在，请刷新列表。")
+            row.japanese_name = japanese_name
+            row.updated_at = now
+            session.add(row)
+            session.flush()
+        return row
+
     def save(self, data: ActressInput, actress_id: int | None = None) -> Actress:
         name = data.name.strip()
         if not name or len(name) > 100 or "\x00" in name:

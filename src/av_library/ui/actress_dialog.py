@@ -66,7 +66,7 @@ class ActressDialog(QDialog):
         form.addRow("头像", avatar_row)
         layout.addLayout(form)
         note = QLabel(
-            "目录可随时修改；允许保存暂时离线的硬盘目录。\n保存后点击「扫描 / 本地文件」识别视频文件名。"
+            "目录可随时修改；日文名可以留空，自动检索时会尝试从公开来源补全。\n保存后点击「扫描 / 本地文件」识别视频文件名。"
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
