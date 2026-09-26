@@ -2,7 +2,7 @@ from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -46,6 +46,15 @@ def label(text: str, style: str = "", wrap: bool = False) -> QLabel:
     result.setObjectName(style)
     result.setWordWrap(wrap)
     return result
+
+
+class ClickableFrame(QFrame):
+    clicked = Signal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class GlobalUpdateWorker(QThread):
@@ -97,6 +106,9 @@ class MainWindow(QMainWindow):
         self.cover_worker: CoverBatchWorker | None = None
         self.cover_paths: dict[str, str] = {}
         self.movie_search_text = ""
+        self._actress_columns: int | None = None
+        self._movie_columns: int | None = None
+        self._movie_grid_width: int | None = None
         self.setWindowTitle("本地作品库 · JPAV Library")
         self.resize(1280, 860)
         self.setMinimumSize(1000, 700)
@@ -168,6 +180,7 @@ class MainWindow(QMainWindow):
         self.actress_grid = QGridLayout(self.actress_canvas)
         self.actress_grid.setContentsMargins(4, 4, 4, 4)
         self.actress_grid.setSpacing(14)
+        self.actress_grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         grid_scroll.setWidget(self.actress_canvas)
         grid_layout.addWidget(grid_scroll, 1)
         self.grid_empty = label("还没有女优资料。点击「添加女优」开始。", "muted", True)
@@ -208,15 +221,16 @@ class MainWindow(QMainWindow):
         self.work_count = label("", "muted")
         work_bar.addWidget(self.work_count)
         detail_layout.addLayout(work_bar)
-        movie_scroll = QScrollArea()
-        movie_scroll.setWidgetResizable(True)
-        movie_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.movie_scroll = QScrollArea()
+        self.movie_scroll.setWidgetResizable(True)
+        self.movie_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.movie_canvas = QWidget()
         self.movie_grid = QGridLayout(self.movie_canvas)
         self.movie_grid.setContentsMargins(4, 4, 4, 4)
         self.movie_grid.setSpacing(12)
-        movie_scroll.setWidget(self.movie_canvas)
-        detail_layout.addWidget(movie_scroll, 1)
+        self.movie_grid.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.movie_scroll.setWidget(self.movie_canvas)
+        detail_layout.addWidget(self.movie_scroll, 1)
         self.movie_empty = label("作品库尚未同步。点击下方「同步作品库」开始。", "muted", True)
         detail_layout.addWidget(self.movie_empty)
         self.movie_info = QFrame()
@@ -256,6 +270,10 @@ class MainWindow(QMainWindow):
         info_layout.addLayout(controls)
         detail_layout.addWidget(self.movie_info)
         self.stack.addWidget(self.detail_page)
+        self.reflow_timer = QTimer(self)
+        self.reflow_timer.setSingleShot(True)
+        self.reflow_timer.setInterval(100)
+        self.reflow_timer.timeout.connect(self.reflow_grids)
         self.statusBar().showMessage(f"本地数据库：{paths.database}")
         self.reload()
         self.refresh_timer = QTimer(self)
@@ -291,9 +309,10 @@ class MainWindow(QMainWindow):
         if self.rows:
             self.rows.sort(key=lambda row: row.last_synced_at or row.updated_at, reverse=True)
         self._clear_grid(self.actress_grid)
-        columns = max(2, min(6, self.width() // 215))
+        columns = self.grid_columns(self.actress_canvas.width(), 196, 14, 6)
+        self._actress_columns = columns
         for index, row in enumerate(self.rows):
-            card = QFrame()
+            card = ClickableFrame()
             card.setObjectName("photoCard")
             card.setFixedSize(196, 248)
             card_layout = QVBoxLayout(card)
@@ -316,7 +335,7 @@ class MainWindow(QMainWindow):
             percent = f" · {stats.completion_percent:.1f}%" if stats.completion_percent is not None else ""
             card_layout.addWidget(label(f"缺少 {stats.missing if stats.scanned else '—'}{percent}", "muted"))
             card.setCursor(Qt.CursorShape.PointingHandCursor)
-            card.mousePressEvent = lambda _event, actress=row: self.open_actress(actress)
+            card.clicked.connect(lambda actress=row: self.open_actress(actress))
             self.actress_grid.addWidget(card, index // columns, index % columns)
         self.count_label.setText(f"{len(self.rows)} 位女优")
         self.grid_empty.setVisible(not self.rows)
@@ -379,39 +398,55 @@ class MainWindow(QMainWindow):
             and (not status_key or row.status == status_key)
         ]
         self._clear_grid(self.movie_grid)
-        columns = max(2, min(8, self.width() // 158))
+        # Emby-inspired poster shelf: consistent portrait ratio and a tight, image-led grid.
+        rows = [row for row in rows if row.is_solo and not row.is_compilation]
+        spacing = self.movie_grid.spacing()
+        usable_width = max(1, self.movie_scroll.viewport().width() - 8)
+        columns = self.grid_columns(usable_width, 186, spacing, 7)
+        self._movie_columns = columns
+        self._movie_grid_width = usable_width
+        base_width, extra_pixels = divmod(usable_width - spacing * (columns - 1), columns)
         needed_urls = []
         for index, view in enumerate(rows):
-            card = QPushButton()
-            card.setObjectName("movieCard")
-            card.setProperty("selected", bool(self.selected_movie and self.selected_movie.movie.id == view.movie.id))
-            card.setFixedSize(142, 224)
+            poster_width = base_width + int(index % columns < extra_pixels)
+            card = ClickableFrame()
+            card.setObjectName("posterCard")
+            card.setFixedWidth(poster_width)
             card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.setProperty("selected", bool(self.selected_movie and self.selected_movie.movie.id == view.movie.id))
             title = view.movie.title or view.movie.japanese_title or "作品标题未收录"
-            status = "已收藏" if view.local_paths else "已忽略" if view.is_ignored else "多人" if not view.is_solo else "合集" if view.is_compilation else "缺少"
+            status = "已收藏" if view.local_paths else "已忽略" if view.is_ignored else "缺少"
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 5)
+            card_layout.setSpacing(5)
+            poster = QLabel()
+            poster.setObjectName("posterImage")
+            poster.setFixedSize(poster_width, round(poster_width * 1.5))
+            poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            poster_url = view.movie.cover_url
             cached = self.covers.cached(view.movie.cover_url)
             if cached:
-                card.setIcon(QIcon(str(cached)))
-                card.setIconSize(QSize(124, 166))
+                poster.setPixmap(self._crop_poster(cached, poster.size()))
             else:
-                card.setText(f"封面\n未缓存\n\n{view.movie.code}")
-                if view.movie.cover_url:
-                    needed_urls.append(view.movie.cover_url)
+                poster.setText(view.movie.code if poster_url else "暂无封面")
+                if poster_url:
+                    needed_urls.append(poster_url)
+            card_layout.addWidget(poster, alignment=Qt.AlignmentFlag.AlignHCenter)
+            card_layout.addWidget(label(view.movie.code, "posterCode"))
+            short_title = title if len(title) <= 32 else title[:31] + "…"
+            card_layout.addWidget(label(short_title, "posterTitle", True))
+            card_layout.addWidget(label(status, "posterStatus"))
             card.setToolTip(f"{view.movie.code} · {title} · {status}")
-            card.clicked.connect(lambda checked=False, movie=view: self.select_movie(movie))
-            card.setStyleSheet(
-                "QPushButton#movieCard { text-align: center; padding: 5px; background: white; border: 1px solid #e1e7ef; border-radius: 9px; }"
-                "QPushButton#movieCard:hover, QPushButton#movieCard[selected='true'] { border: 2px solid #3267d6; background: #edf3ff; }"
-            )
-            tile = QWidget()
-            tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(0, 0, 0, 0)
-            tile_layout.setSpacing(3)
-            tile_layout.addWidget(card)
-            tile_layout.addWidget(label(f"{view.movie.code}  ·  {status}", "tileMeta"))
-            self.movie_grid.addWidget(tile, index // columns, index % columns)
+            card.clicked.connect(lambda movie=view: self.select_movie(movie))
+            self.movie_grid.addWidget(card, index // columns, index % columns, Qt.AlignmentFlag.AlignTop)
         self.work_count.setText(f"{len(rows)} 部")
-        self.movie_empty.setVisible(not self.movie_rows)
+        self.movie_empty.setVisible(not rows)
+        if not rows:
+            self.movie_empty.setText(
+                "没有符合条件的作品。"
+                if self.movie_rows
+                else "作品库尚未同步，或当前没有可展示的单人非合集作品。"
+            )
         if rows and (not self.selected_movie or all(self.selected_movie.movie.id != row.movie.id for row in rows)):
             self.selected_movie = rows[0]
             self.update_movie_info(rows[0])
@@ -424,10 +459,43 @@ class MainWindow(QMainWindow):
                 self.cover_worker.finished.connect(self.cover_worker.deleteLater)
                 self.cover_worker.start()
 
+    @staticmethod
+    def grid_columns(width: int, item_width: int, spacing: int, maximum: int) -> int:
+        return max(1, min(maximum, (max(0, width) + spacing) // (item_width + spacing)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        timer = getattr(self, "reflow_timer", None)
+        if timer:
+            timer.start()
+
+    @Slot()
+    def reflow_grids(self):
+        actress_columns = self.grid_columns(self.actress_canvas.width(), 196, 14, 6)
+        movie_width = max(1, self.movie_scroll.viewport().width() - 8)
+        if actress_columns != self._actress_columns:
+            self.reload(self.current.id if self.current else None)
+        if movie_width != self._movie_grid_width and self.current:
+            self.render_movies()
+
     @Slot(dict)
     def covers_ready(self, covers: dict):
         self.cover_paths.update({url: path for url, path in covers.items() if path})
         self.render_movies()
+
+    @staticmethod
+    def _crop_poster(path: Path, size: QSize) -> QPixmap:
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return pixmap
+        scaled = pixmap.scaled(
+            size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        left = max(0, (scaled.width() - size.width()) // 2)
+        top = max(0, (scaled.height() - size.height()) // 2)
+        return scaled.copy(left, top, size.width(), size.height())
 
     @Slot()
     def cover_batch_finished(self):
